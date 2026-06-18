@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aws-config = { version = "1.8.18", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.137.0"
+object_store = "0.13.2"
+tokio = "1.52.3"
 
 [dev-dependencies]
+aws-credential-types = "1.2.14"
 testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15.0", features = ["minio"] }
+tokio = { version = "1.52.3", features = ["full", "test-util"] }
