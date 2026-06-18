@@ -2,28 +2,21 @@
  * There are MiniO feature tests just to make sure our expectations are valid.
  */
 
-use aws_sdk_s3::error::ProvideErrorMetadata as _;
+use s3::{Auth, BlockingClient, Credentials};
 use testcontainers::ContainerAsync;
 use testcontainers_modules::{minio::MinIO, testcontainers::runners::AsyncRunner};
 
-async fn minio_s3_client(container: &ContainerAsync<MinIO>) -> aws_sdk_s3::Client {
+async fn minio_s3_client(container: &ContainerAsync<MinIO>) -> BlockingClient {
     let port = container.get_host_port_ipv4(9000).await.unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
 
-    let config = aws_config::from_env()
-        .endpoint_url(&endpoint)
-        .credentials_provider(aws_credential_types::Credentials::new(
-            "minioadmin",
-            "minioadmin",
-            None,
-            None,
-            "test",
-        ))
-        .region(aws_config::Region::new("us-east-1"))
-        .load()
-        .await;
-
-    aws_sdk_s3::Client::new(&config)
+    let credentials = Credentials::new("minioadmin", "minioadmin").unwrap();
+    BlockingClient::builder(&endpoint)
+        .unwrap()
+        .region("us-east-1")
+        .auth(Auth::Static(credentials))
+        .build()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -33,35 +26,36 @@ async fn test_cas_create() {
 
     let bucket_name = "cas-create";
     let filename = "thefile";
-    let _bucket = client
-        .create_bucket()
-        .bucket(bucket_name)
+
+    client.buckets().create(bucket_name).send().unwrap();
+
+    client
+        .objects()
+        .put(bucket_name, filename)
+        .body_bytes(b"body1".to_vec())
+        .if_none_match("*")
+        .unwrap()
         .send()
-        .await
         .unwrap();
 
-    let body1 = aws_sdk_s3::primitives::ByteStream::from_static(b"body");
-    let _upload1 = client
-        .put_object()
-        .bucket(bucket_name)
-        .key(filename)
-        .body(body1)
+    let err = client
+        .objects()
+        .put(bucket_name, filename)
+        .body_bytes(b"body2".to_vec())
         .if_none_match("*")
+        .unwrap()
         .send()
-        .await
-        .unwrap();
+        .unwrap_err();
 
-    let body2 = aws_sdk_s3::primitives::ByteStream::from_static(b"body");
-    let upload_res2 = client
-        .put_object()
-        .bucket(bucket_name)
-        .key(filename)
-        .body(body2)
-        .if_none_match("*")
-        .send()
-        .await;
-    assert!(upload_res2.is_err(), "{upload_res2:?}");
-    assert_eq!(upload_res2.unwrap_err().code(), Some("PreconditionFailed"));
+    assert!(
+        matches!(
+            &err,
+            s3::Error::Api { status, code, .. }
+                if status.as_u16() == 412
+                && code.as_deref() == Some("PreconditionFailed")
+        ),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -71,55 +65,46 @@ async fn test_cas_update() {
 
     let bucket_name = "cas-update";
     let filename = "thefile";
+    client.buckets().create(bucket_name).send().unwrap();
+
     client
-        .create_bucket()
-        .bucket(bucket_name)
+        .objects()
+        .put(bucket_name, filename)
+        .body_bytes(b"body1".to_vec())
         .send()
-        .await
-        .unwrap();
-
-    let body1 = aws_sdk_s3::primitives::ByteStream::from_static(b"body1");
-    let body2 = aws_sdk_s3::primitives::ByteStream::from_static(b"body2");
-    let body3 = aws_sdk_s3::primitives::ByteStream::from_static(b"body2");
-
-    let _upload1 = client
-        .put_object()
-        .bucket(bucket_name)
-        .key(filename)
-        .body(body1)
-        .send()
-        .await
         .unwrap();
 
     let etag = client
-        .head_object()
-        .bucket(bucket_name)
-        .key(filename)
+        .objects()
+        .head(bucket_name, filename)
         .send()
-        .await
         .unwrap()
-        .e_tag
+        .etag
         .unwrap();
 
-    // Overwrite the object.
-    let _upload2 = client
-        .put_object()
-        .bucket(bucket_name)
-        .key(filename)
-        .body(body2)
+    client
+        .objects()
+        .put(bucket_name, filename)
+        .body_bytes(b"body2".to_vec())
         .send()
-        .await
         .unwrap();
 
-    let upload_res3 = client
-        .put_object()
-        .bucket(bucket_name)
-        .key(filename)
-        .body(body3)
-        .if_match(etag)
+    let err = client
+        .objects()
+        .put(bucket_name, filename)
+        .body_bytes(b"body2".to_vec())
+        .if_match(&etag)
+        .unwrap()
         .send()
-        .await;
-    
-    assert!(upload_res3.is_err(), "{upload_res3:?}");
-    assert_eq!(upload_res3.unwrap_err().code(), Some("PreconditionFailed"));
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &err,
+            s3::Error::Api { status, code, .. }
+                if status.as_u16() == 412
+                && code.as_deref() == Some("PreconditionFailed")
+        ),
+        "unexpected error: {err:?}"
+    );
 }
