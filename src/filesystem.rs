@@ -4,9 +4,10 @@ mod store;
 mod tree;
 
 pub use file::S3VirtualFile;
+use store::{CasOutcome, Versioned};
 
-use std::{fmt, path::Component};
 use std::path::Path;
+use std::{fmt, path::Component};
 
 use virtual_fs::{FsError, OpenOptionsConfig, Result as FsResult};
 
@@ -32,7 +33,8 @@ impl S3FileSystem {
     pub fn init(bucket: String, client: s3::BlockingClient) -> Self {
         let fs = Self::new(bucket, client);
         fs.store.create_bucket().unwrap();
-        fs.put_dir(&ObjName::root(), &DirObj::default()).unwrap();
+        fs.put_dir_create(&ObjName::root(), &DirObj::default())
+            .unwrap();
         fs
     }
 
@@ -49,7 +51,7 @@ impl S3FileSystem {
         Ok(obj_name)
     }
 
-    fn resolve_dir(&self, path: &Path) -> FsResult<DirObj> {
+    fn resolve_dir(&self, path: &Path) -> FsResult<Versioned<DirObj>> {
         let obj_name = self.resolve_dir_ref(path)?;
         self.load_dir(&obj_name)
     }
@@ -57,6 +59,7 @@ impl S3FileSystem {
     fn resolve_dir_component(&self, parent_name: &ObjName, component: &str) -> FsResult<ObjName> {
         let parent = self.load_dir(parent_name)?;
         let obj_ref = parent
+            .as_ref()
             .get(component)
             .ok_or_else(|| FsError::EntryNotFound)?;
         if !matches!(obj_ref.obj_name, ObjName::Dir(_)) {
@@ -66,7 +69,7 @@ impl S3FileSystem {
         }
     }
 
-    fn load_dir(&self, obj_name: &ObjName) -> FsResult<DirObj> {
+    fn load_dir(&self, obj_name: &ObjName) -> FsResult<Versioned<DirObj>> {
         // Guard against loading a file as a directory: the object content might
         // happen to deserialize as a `DirObj`, so the name's type is the only
         // reliable check.
@@ -74,25 +77,43 @@ impl S3FileSystem {
             return Err(FsError::InvalidInput);
         }
         let data = self.store.get(&obj_name.to_string())?;
-        DirObj::deserialize(&data)
+        let (data, etag) = data.into_inner();
+        DirObj::deserialize(&data).map(|data| Versioned::new(data, etag))
     }
 
-    fn put_dir(&self, obj_name: &ObjName, obj: &DirObj) -> FsResult<()> {
-        self.store.put(&obj_name.to_string(), obj.serialize()?)
+    /// Creates a directory object, failing if it already exists.
+    fn put_dir_create(&self, obj_name: &ObjName, obj: &DirObj) -> FsResult<CasOutcome> {
+        self.store
+            .put_if_none_match(&obj_name.to_string(), obj.serialize()?)
     }
 
-    fn update_dir(
+    /// Replaces a directory object only if it still has ETag `etag`.
+    fn put_dir_cas(&self, obj_name: &ObjName, etag: &str, obj: &DirObj) -> FsResult<CasOutcome> {
+        self.store
+            .put_if_match(&obj_name.to_string(), obj.serialize()?, etag)
+    }
+
+    /// Atomically updates a directory object with optimistic concurrency.
+    ///
+    /// `function` must be a *pure* `&DirObj -> (new_dir, R)`: it is re-run from a
+    /// freshly loaded copy on every CAS conflict, so it must not have side
+    /// effects (object creation/deletion belongs outside this loop). `R` is
+    /// threaded out to the caller so it can, e.g., learn which child object to
+    /// delete *after* the unlink has committed.
+    fn update_dir<R>(
         &self,
         obj_name: &ObjName,
-        function: impl Fn(DirObj) -> FsResult<DirObj>,
-    ) -> FsResult<DirObj> {
-        // TODO CAS update
-        let dir_obj = self.load_dir(obj_name)?;
-        let modified_dir_obj = function(dir_obj)?;
+        function: impl Fn(&DirObj) -> FsResult<(DirObj, R)>,
+    ) -> FsResult<R> {
+        loop {
+            let current = self.load_dir(obj_name)?;
+            let (new_dir, ret) = function(current.as_ref())?;
 
-        self.put_dir(obj_name, &modified_dir_obj)?;
-
-        Ok(modified_dir_obj)
+            match self.put_dir_cas(obj_name, current.etag(), &new_dir)? {
+                CasOutcome::Written => return Ok(ret),
+                CasOutcome::Conflict => continue, // someone else won; reload and retry
+            }
+        }
     }
 
     /// Opens `path` according to `conf`, returning the concrete file enum.
@@ -104,7 +125,11 @@ impl S3FileSystem {
     ///
     /// Everything else (appending, opening an existing file for writing, etc.)
     /// is rejected, matching the design's "new files, written whole" model.
-    fn open_file(&self, path: &std::path::Path, conf: &OpenOptionsConfig) -> FsResult<S3VirtualFile> {
+    fn open_file(
+        &self,
+        path: &std::path::Path,
+        conf: &OpenOptionsConfig,
+    ) -> FsResult<S3VirtualFile> {
         let parent = path.parent().ok_or(FsError::InvalidInput)?;
         let parent_ref = self.resolve_dir_ref(parent)?;
         let name = path
@@ -114,7 +139,7 @@ impl S3FileSystem {
             .to_string();
 
         let parent_dir = self.load_dir(&parent_ref)?;
-        let existing = parent_dir.get(&name);
+        let existing = parent_dir.as_ref().get(&name);
 
         // Read-only open of an existing file.
         if conf.read && !conf.write && !conf.append && !conf.create && !conf.create_new {

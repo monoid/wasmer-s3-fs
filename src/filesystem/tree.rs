@@ -8,7 +8,7 @@ use virtual_fs::{DirEntry, FileType, Metadata, Result as FsResult};
 
 use super::ROOT_OBJ_NAME;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirObj {
     pub(crate) children: HashMap<String, S3FsDirEntry>,
 }
@@ -37,7 +37,7 @@ impl DirObj {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct S3FsDirEntry {
     pub obj_name: ObjName,
     pub ctime: u64,

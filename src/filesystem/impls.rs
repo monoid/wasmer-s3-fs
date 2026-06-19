@@ -15,64 +15,69 @@ impl FileSystem for S3FileSystem {
 
     fn read_dir(&self, path: &std::path::Path) -> FSResult<virtual_fs::ReadDir> {
         let dir_obj = self.resolve_dir(path)?;
-        Ok(virtual_fs::ReadDir::new(dir_obj.into_dir_entries(path)))
+        Ok(virtual_fs::ReadDir::new(dir_obj.as_ref().into_dir_entries(path)))
     }
 
     fn create_dir(&self, path: &std::path::Path) -> FSResult<()> {
-        use std::collections::hash_map::Entry;
-
         let parent = path.parent().ok_or_else(|| FsError::InvalidInput)?;
         let parent_ref = self.resolve_dir_ref(parent)?;
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        self.update_dir(&parent_ref, |mut dir| {
-            match dir.children.entry(file_name.clone()) {
-                Entry::Occupied(_occupied_entry) => return Err(FsError::AlreadyExists),
-                Entry::Vacant(vacant_entry) => {
-                    let dir_obj_name = ObjName::gen_dir();
-                    self.put_dir(&dir_obj_name, &DirObj::default())?;
+        // Create the child directory object first (data-before-pointer). If the
+        // name turns out to be taken, this object is simply left unreferenced
+        // for the garbage collector.
+        let dir_obj_name = ObjName::gen_dir();
+        self.put_dir_create(&dir_obj_name, &DirObj::default())?;
+        let ctime = timestamp();
 
-                    let since_the_epoch = timestamp();
-
-                    vacant_entry.insert(S3FsDirEntry {
-                        obj_name: dir_obj_name,
-                        ctime: since_the_epoch,
-                        len: 0,
-                    });
-                }
-            };
-            Ok(dir)
+        // The closure must stay pure: it can be re-run on a CAS conflict.
+        self.update_dir(&parent_ref, |old_dir| {
+            if old_dir.children.contains_key(&file_name) {
+                return Err(FsError::AlreadyExists);
+            }
+            let mut dir = old_dir.clone();
+            dir.children.insert(
+                file_name.clone(),
+                S3FsDirEntry {
+                    obj_name: dir_obj_name.clone(),
+                    ctime,
+                    len: 0,
+                },
+            );
+            Ok((dir, ()))
         })?;
         Ok(())
     }
 
     fn remove_dir(&self, path: &std::path::Path) -> FSResult<()> {
-        use std::collections::hash_map::Entry;
-
         let parent = path.parent().ok_or_else(|| FsError::InvalidInput)?;
         let parent_ref = self.resolve_dir_ref(parent)?;
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        self.update_dir(&parent_ref, |mut dir| {
-            match dir.children.entry(file_name.clone()) {
-                Entry::Occupied(occupied_entry) => {
-                    let dir_obj_name = &occupied_entry.get().obj_name;
+        // Unlink from the parent via CAS; the closure yields the child object
+        // name so it can be deleted *after* the unlink has committed (deleting
+        // earlier would leave a dangling reference if the CAS were to fail).
+        let child = self.update_dir(&parent_ref, |old_dir| {
+            let ent = old_dir
+                .children
+                .get(&file_name)
+                .ok_or(FsError::EntryNotFound)?;
+            let child = ent.obj_name.clone();
 
-                    let dir_obj = self.load_dir(dir_obj_name)?;
-                    if !dir_obj.children.is_empty() {
-                        return Err(FsError::DirectoryNotEmpty);
-                    }
-                    self.store.delete(&dir_obj_name.to_string())?;
-                    occupied_entry.remove();
-                }
-                Entry::Vacant(_vacant_entry) => {
-                    return Err(FsError::EntryNotFound);
-                }
+            // `load_dir` also rejects a non-directory entry (`InvalidInput`).
+            let child_dir = self.load_dir(&child)?;
+            if !child_dir.as_ref().children.is_empty() {
+                return Err(FsError::DirectoryNotEmpty);
             }
-            Ok(dir)
+
+            let mut dir = old_dir.clone();
+            dir.children.remove(&file_name);
+            Ok((dir, child))
         })?;
+
+        self.store.delete(&child.to_string())?;
         Ok(())
     }
 
@@ -90,6 +95,7 @@ impl FileSystem for S3FileSystem {
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         let ent = parent_dir_obj
+            .as_ref()
             .get(&file_name)
             .ok_or(FsError::EntryNotFound)?;
 
@@ -101,34 +107,28 @@ impl FileSystem for S3FileSystem {
     }
 
     fn remove_file(&self, path: &std::path::Path) -> FSResult<()> {
-        use std::collections::hash_map::Entry;
-
         let parent = path.parent().ok_or_else(|| FsError::InvalidInput)?;
         let parent_ref = self.resolve_dir_ref(parent)?;
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        self.update_dir(&parent_ref, |mut dir| {
-            match dir.children.entry(file_name.clone()) {
-                Entry::Occupied(occupied_entry) => {
-                    let dir_obj_name = &occupied_entry.get().obj_name;
-
-                    match dir_obj_name {
-                        ObjName::File(_) => {
-                            self.store.delete(&dir_obj_name.to_string())?;
-                            occupied_entry.remove();
-                        }
-                        ObjName::Dir(_) => {
-                            return Err(FsError::InvalidInput);
-                        }
-                    }
-                }
-                Entry::Vacant(_vacant_entry) => {
-                    return Err(FsError::EntryNotFound);
-                }
+        // Same shape as `remove_dir`: CAS-unlink first, then delete the object.
+        let child = self.update_dir(&parent_ref, |old_dir| {
+            let ent = old_dir
+                .children
+                .get(&file_name)
+                .ok_or(FsError::EntryNotFound)?;
+            if !matches!(ent.obj_name, ObjName::File(_)) {
+                return Err(FsError::InvalidInput);
             }
-            Ok(dir)
+            let child = ent.obj_name.clone();
+
+            let mut dir = old_dir.clone();
+            dir.children.remove(&file_name);
+            Ok((dir, child))
         })?;
+
+        self.store.delete(&child.to_string())?;
         Ok(())
     }
 

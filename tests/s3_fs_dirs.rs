@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use s3::{Auth, BlockingClient, Credentials};
 use s3_fs::S3FileSystem;
@@ -123,4 +124,33 @@ async fn test_dir_metadata_nested() {
         modified: 0,
     };
     assert_eq!(metadata, expected);
+}
+
+/// Many threads creating distinct children in the *same* parent directory race
+/// on the parent object's CAS update. With the retry loop in `update_dir`, every
+/// create must eventually succeed and no update may be lost.
+#[tokio::test]
+async fn test_concurrent_create_dir_same_parent() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = Arc::new(S3FileSystem::init("fs-cas".to_owned(), client));
+    fs.create_dir(&PathBuf::from("/d")).unwrap();
+
+    const N: usize = 12;
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let fs = Arc::clone(&fs);
+            std::thread::spawn(move || {
+                fs.create_dir(&PathBuf::from(format!("/d/child{i}"))).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // All N children survived the concurrent CAS updates (none lost).
+    let count = fs.read_dir(&PathBuf::from("/d")).unwrap().count();
+    assert_eq!(count, N);
 }
