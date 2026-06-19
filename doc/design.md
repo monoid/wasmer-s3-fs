@@ -236,6 +236,34 @@ stop-the-world and without state outside S3:
    tombstoned directory is invisible to normal operations, leaving the work to a
    later sweep is safe.
 
+## Prior art
+
+The design space for "a filesystem over object storage" spans a spectrum from
+"keep everything in the blob store" to "keep metadata in a separate database":
+
+* **Network filesystems (NFS, etc.)** — the latency baseline this system aims to
+  beat. They assume a low-latency, mutable backing store; object storage is
+  neither, so the data model has to be rethought rather than ported.
+* **S3-as-a-filesystem gateways (`s3fs`, `goofys`, `mountpoint-s3`)** — map paths
+  directly to keys. Simple single-file access, but directories are emulated via
+  `LIST`, and renames are non-atomic copies. This is essentially Alternative 2.
+* **JuiceFS** — the canonical "metadata elsewhere" design: file *data* is chunked
+  into an object store, while *metadata* (the tree, atomic renames, locks) lives
+  in a separate strongly-consistent database (Redis / TiKV / FoundationDB / …).
+  It is the living example of the external-coordination tradeoff in
+  Alternative 4: fast and simple metadata operations, at the price of a second
+  system that is its own point of failure. Our design deliberately sits at the
+  opposite end — everything in S3 — to maximize availability.
+* **Content-addressed / log-structured stores (Git, and Git-like layouts on blob
+  storage)** — immutable nodes keyed by content hash plus a single mutable root
+  pointer. This is the root-pointer alternative referenced in the
+  [Concurrency model](#concurrency-model): atomic whole-tree commits and free
+  snapshots, at the cost of root contention.
+
+This design is closest in spirit to "everything in S3" while borrowing the
+inode-indirection idea (uuid object names) from traditional filesystems to keep
+renames cheap.
+
 ## Alternatives
 1. *Storing the directory structure elsewhere.* It would add another point of
    failure to the system. While some additional service (DB) may be useful for
@@ -245,3 +273,43 @@ stop-the-world and without state outside S3:
    access a single file, but renames would be more challenging and non-atomic.
 3. *Storing file content as sequence of blocks.*  It would allow partial
    updates, but the implementation is much more complex.
+4. *External coordination (etcd / ZooKeeper / FoundationDB).* Instead of
+   building locking and concurrency control on top of S3 conditional writes, a
+   dedicated coordination service could provide them directly. This is a real
+   simplification of the *coordination code*, but it trades against two
+   properties this task prizes ("minimize state outside S3", resilience), so it
+   is an alternative rather than the chosen design.
+
+   What it buys:
+   * **Leases that expire on client death** (etcd leases, ZooKeeper ephemeral
+     nodes) — no home-grown S3 `lock` object with a TTL to renew.
+   * **Fencing for free** via monotonic revisions (`mod_revision`, `zxid`),
+     i.e. the "stalled lock holder wakes up and writes" hazard is handled.
+   * **Change notifications (watches)** — the strongest reason to reach for such
+     a service. Efficient *multi-writer* caching needs cache invalidation when
+     another writer mutates a directory, and S3 has no low-latency push
+     (its event notifications are async, via SQS/SNS/Lambda). The value here is
+     notification, not locking per se.
+
+   What it does *not* solve:
+   * **Multi-object atomicity still does not exist.** A lock on directory `D`
+     gives mutual exclusion, but `rename` still writes two S3 objects
+     non-atomically; a crash mid-way still needs the same recovery. The lock
+     removes the *concurrent* hazard, not the *crash* hazard.
+   * **Two sources of truth.** The coordinator's view can diverge from S3 after
+     partial failures, and writes now require a quorum service *and* S3 to be
+     up — cutting against the read-only-fallback resilience goal (reads can
+     still go straight to S3, lock-free).
+   * **Operational cost** of running a quorum service per cluster/region.
+
+   If adopted, the clean boundary is: coordination (leases + watches) in the
+   external service, all durable state and the mutation protocol in S3.
+   `FoundationDB` is the outlier — it offers genuine multi-key transactions,
+   which *would* close the S3 multi-object-atomicity gap, at the cost of a heavy
+   dependency and a paradigm shift (metadata in FDB, blobs in S3 — essentially
+   the JuiceFS model below).
+
+   Note on tech choices: `etcd` (Raft, CNCF, used by Kubernetes) is the modern
+   default; `ZooKeeper` is still maintained but increasingly legacy — Kafka,
+   its largest user, removed ZooKeeper support in 4.0 in favor of its own Raft
+   (KRaft).
