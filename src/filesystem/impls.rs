@@ -111,7 +111,39 @@ impl FileSystem for S3FileSystem {
     }
 
     fn remove_file(&self, path: &std::path::Path) -> FSResult<()> {
-        todo!()
+        use std::collections::hash_map::Entry;
+
+        let parent = path.parent().ok_or_else(|| FsError::InvalidInput)?;
+        let parent_ref = self.resolve_dir_ref(parent)?;
+
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+
+        self.update_dir(&parent_ref, |mut dir| {
+            match dir.children.entry(file_name.clone()) {
+                Entry::Occupied(occupied_entry) => {
+                    let dir_obj_name = &occupied_entry.get().obj_name;
+
+                    match dir_obj_name {
+                        ObjName::File(file_obj_name) => {
+                            self.client
+                                .objects()
+                                .delete(&self.bucket, file_obj_name.to_string())
+                                .send()
+                                .unwrap();
+                            occupied_entry.remove();
+                        }
+                        ObjName::Dir(_) => {
+                            return Err(FsError::InvalidInput);
+                        }
+                    }
+                }
+                Entry::Vacant(_vacant_entry) => {
+                    return Err(FsError::EntryNotFound);
+                }
+            }
+            Ok(dir)
+        })?;
+        Ok(())
     }
 
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {

@@ -40,7 +40,7 @@ impl S3FileSystem {
         let mut obj_name = ObjName::root();
         for comp in path.components() {
             if !matches!(comp, Component::RootDir) {
-                // TODO we assume the paths are "normal".
+                // TODO we assume the components are "normal".
                 obj_name =
                     self.resolve_dir_component(&obj_name, &comp.as_os_str().to_string_lossy())?;
             }
@@ -67,6 +67,9 @@ impl S3FileSystem {
     }
 
     fn load_dir(&self, obj_name: &ObjName) -> FsResult<DirObj> {
+        if !matches!(obj_name, ObjName::Dir(_)) {
+            return Err(FsError::InvalidInput);
+        }
         let req = self
             .client
             .objects()

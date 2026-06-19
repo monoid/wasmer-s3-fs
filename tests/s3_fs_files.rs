@@ -5,7 +5,19 @@ use s3_fs::S3FileSystem;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::{minio::MinIO, testcontainers::runners::AsyncRunner};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use virtual_fs::FileSystem;
+use virtual_fs::{FileSystem, FsError};
+
+/// Creates `path` with the given `contents` and closes it.
+async fn write_file(fs: &S3FileSystem, path: &PathBuf, contents: &[u8]) {
+    let mut file = fs
+        .new_open_options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap();
+    file.write_all(contents).await.unwrap();
+    file.shutdown().await.unwrap();
+}
 
 async fn minio_s3_client(container: &ContainerAsync<MinIO>) -> BlockingClient {
     let port = container.get_host_port_ipv4(9000).await.unwrap();
@@ -190,4 +202,95 @@ async fn test_append_unsupported() {
         .create(true)
         .open(&PathBuf::from("/appended"))
         .unwrap_err();
+}
+
+/// Removing a file deletes its directory entry; the name is then free to reuse.
+#[tokio::test]
+async fn test_remove_file() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-files".to_owned(), client);
+    let path = PathBuf::from("/removable");
+
+    write_file(&fs, &path, b"to be deleted").await;
+    assert!(fs.metadata(&path).is_ok());
+
+    fs.remove_file(&path).unwrap();
+
+    // The entry is gone: metadata and opening for read both fail.
+    assert_eq!(fs.metadata(&path).unwrap_err(), FsError::EntryNotFound);
+    fs.new_open_options().read(true).open(&path).unwrap_err();
+
+    // And the name can be created anew.
+    write_file(&fs, &path, b"recreated").await;
+    let mut file = fs.new_open_options().read(true).open(&path).unwrap();
+    let mut read_back = Vec::new();
+    file.read_to_end(&mut read_back).await.unwrap();
+    assert_eq!(read_back, b"recreated");
+}
+
+/// Removing a file inside a sub-directory works and leaves the directory intact.
+#[tokio::test]
+async fn test_remove_file_in_subdir() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-files".to_owned(), client);
+    fs.create_dir(&PathBuf::from("/dir")).unwrap();
+
+    let path = PathBuf::from("/dir/nested.txt");
+    write_file(&fs, &path, b"nested").await;
+
+    fs.remove_file(&path).unwrap();
+
+    assert_eq!(fs.metadata(&path).unwrap_err(), FsError::EntryNotFound);
+    // The parent directory itself still exists.
+    assert!(fs.metadata(&PathBuf::from("/dir")).unwrap().is_dir());
+}
+
+/// `remove_dir` refuses to remove a regular file — even one whose contents
+/// happen to look exactly like a (valid, empty) directory object. The rejection
+/// must come from the entry's type, not from deserialization failing.
+#[tokio::test]
+async fn test_remove_dir_on_file_fails() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-files".to_owned(), client);
+    let path = PathBuf::from("/afile");
+    // Plant a file whose body is a perfectly valid serialized `DirObj`.
+    write_file(&fs, &path, br#"{"children":{}}"#).await;
+
+    assert_eq!(fs.remove_dir(&path).unwrap_err(), FsError::InvalidInput);
+    // The file is untouched.
+    assert!(fs.metadata(&path).unwrap().is_file());
+}
+
+/// Removing a file that does not exist fails with `EntryNotFound`.
+#[tokio::test]
+async fn test_remove_file_missing() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-files".to_owned(), client);
+    assert_eq!(
+        fs.remove_file(&PathBuf::from("/nope")).unwrap_err(),
+        FsError::EntryNotFound
+    );
+}
+
+/// `remove_file` refuses to remove a directory.
+#[tokio::test]
+async fn test_remove_file_on_dir_fails() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-files".to_owned(), client);
+    let path = PathBuf::from("/adir");
+    fs.create_dir(&path).unwrap();
+
+    assert_eq!(fs.remove_file(&path).unwrap_err(), FsError::InvalidInput);
+    // The directory is untouched.
+    assert!(fs.metadata(&path).unwrap().is_dir());
 }
