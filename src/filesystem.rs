@@ -1,10 +1,13 @@
+mod file;
 mod impls;
 mod tree;
+
+pub use file::S3VirtualFile;
 
 use std::{fmt, path::Component};
 use std::path::Path;
 
-use virtual_fs::{FsError, Result as FsResult};
+use virtual_fs::{FsError, OpenOptionsConfig, Result as FsResult};
 
 use self::tree::{DirObj, ObjName};
 
@@ -107,6 +110,72 @@ impl S3FileSystem {
 
         Ok(modified_dir_obj)
     }
+
+    /// Opens `path` according to `conf`, returning the concrete file enum.
+    ///
+    /// Only two flag combinations are accepted:
+    ///
+    /// * read-only — opens an existing file for reading;
+    /// * write + create — creates a brand new file.
+    ///
+    /// Everything else (appending, opening an existing file for writing, etc.)
+    /// is rejected, matching the design's "new files, written whole" model.
+    fn open_file(&self, path: &std::path::Path, conf: &OpenOptionsConfig) -> FsResult<S3VirtualFile> {
+        let parent = path.parent().ok_or(FsError::InvalidInput)?;
+        let parent_ref = self.resolve_dir_ref(parent)?;
+        let name = path
+            .file_name()
+            .ok_or(FsError::InvalidInput)?
+            .to_string_lossy()
+            .to_string();
+
+        let parent_dir = self.load_dir(&parent_ref)?;
+        let existing = parent_dir.get(&name);
+
+        // Read-only open of an existing file.
+        if conf.read && !conf.write && !conf.append && !conf.create && !conf.create_new {
+            let ent = existing.ok_or(FsError::EntryNotFound)?;
+            if !matches!(ent.obj_name, ObjName::File(_)) {
+                return Err(FsError::InvalidInput);
+            }
+            return Ok(S3VirtualFile::new_read(
+                self.client.clone(),
+                self.bucket.clone(),
+                ent.obj_name.clone(),
+                ent.len,
+                ent.ctime,
+            ));
+        }
+
+        // Write + create of a brand new file.
+        if conf.write && !conf.append && (conf.create || conf.create_new) {
+            // Only new files can be written (no updates, see design limitations).
+            if existing.is_some() {
+                return Err(FsError::AlreadyExists);
+            }
+
+            let obj_name = ObjName::gen_file();
+            let upload_id = self
+                .client
+                .objects()
+                .create_multipart_upload(&self.bucket, obj_name.to_string())
+                .send()
+                .map_err(|_| FsError::IOError)?
+                .upload_id;
+
+            return Ok(S3VirtualFile::new_write(
+                self.client.clone(),
+                self.bucket.clone(),
+                obj_name,
+                upload_id,
+                parent_ref,
+                name,
+                timestamp(),
+            ));
+        }
+
+        Err(FsError::Unsupported)
+    }
 }
 
 impl fmt::Debug for S3FileSystem {
@@ -115,4 +184,13 @@ impl fmt::Debug for S3FileSystem {
             .field("root_dir", &self.root_dir)
             .finish_non_exhaustive()
     }
+}
+
+pub(crate) fn timestamp() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let start = SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(UNIX_EPOCH)
+        .expect("time should go forward");
+    since_the_epoch.as_secs()
 }

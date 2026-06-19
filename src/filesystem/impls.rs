@@ -1,7 +1,10 @@
 use futures_core::future::BoxFuture;
-use virtual_fs::{FileSystem, FsError, Result as FSResult};
+use virtual_fs::{
+    FileOpener, FileSystem, FsError, OpenOptions, OpenOptionsConfig, Result as FSResult,
+    VirtualFile,
+};
 
-use crate::filesystem::tree::{DirObj, ObjName, S3FsDirEntry};
+use crate::filesystem::{timestamp, tree::{DirObj, ObjName, S3FsDirEntry}};
 
 use super::S3FileSystem;
 
@@ -112,7 +115,7 @@ impl FileSystem for S3FileSystem {
     }
 
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
-        todo!()
+        OpenOptions::new(self)
     }
 
     fn mount(
@@ -125,11 +128,13 @@ impl FileSystem for S3FileSystem {
     }
 }
 
-fn timestamp() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let start = SystemTime::now();
-    let since_the_epoch = start
-        .duration_since(UNIX_EPOCH)
-        .expect("time should go forward");
-    since_the_epoch.as_secs()
+impl FileOpener for S3FileSystem {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        conf: &OpenOptionsConfig,
+    ) -> FSResult<Box<dyn VirtualFile + Send + Sync + 'static>> {
+        Ok(Box::new(self.open_file(path, conf)?))
+    }
 }
+
