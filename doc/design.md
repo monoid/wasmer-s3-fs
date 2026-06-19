@@ -82,9 +82,10 @@ Two primitives are enough to build everything:
 
 1. **Per-object compare-and-swap.** Every directory mutation is a
    read-modify-write guarded by a conditional `PUT` (`If-Match: <etag>` for an
-   update, `If-None-Match: *` for a create), retried on `412
-   PreconditionFailed`. This is what `update_dir` does (the prototype still has
-   this as a `TODO` — see "Prototype" below).
+   update, `If-None-Match: *` for a create). A lost CAS race surfaces as `412
+   PreconditionFailed`, which `update_dir` treats as a retry signal: it reloads
+   the object and re-runs a *pure* transform closure until the conditional write
+   commits. (This loop is implemented in the prototype.)
 
 2. **A volume lease lock.** A single `lock` object created with
    `If-None-Match: *` (create-if-absent) holding `{owner_id, expiry,
@@ -130,6 +131,49 @@ No volume lock is taken; writers coordinate purely through per-object CAS.
 
 * **Readers never take any lock** in either mode — they just read tree objects
   (optionally cached and validated by ETag).
+
+### Two-phase directory deletion
+
+Removing a directory is a second multi-object hazard, subtler than rename and
+worth spelling out because it is easy to get wrong. Naively, `remove_dir(D)`
+would check that `D`'s object is empty, then unlink the entry for `D` from its
+**parent** and delete `D`'s object. But the emptiness check reads `D` while the
+commit is a CAS on the *parent* — two different objects. A concurrent
+`create_dir(D/x)` commits via a CAS on **`D`**, so it does not conflict with the
+parent CAS. The interleaving
+
+> remove reads `D` empty → create inserts `x` into `D` → remove unlinks and deletes `D`
+
+silently loses the freshly created `x`.
+
+The fix is to move the deletion's commit point onto **`D` itself**, so it
+contends with inserts into `D`:
+
+1. **Seal** `D` by CAS-writing a `deleted` tombstone onto its own object,
+   conditional on it still being empty.
+2. **Unlink** the entry for `D` from the parent.
+3. **Delete** `D`'s object.
+
+Now removal and a racing insert both CAS the same object `D`:
+
+* if the tombstone lands first, the insert's retry reloads `D`, sees the
+  tombstone, and is refused;
+* if the insert lands first, the tombstone attempt reloads `D`, sees it
+  non-empty, and fails with `DirectoryNotEmpty`.
+
+A tombstoned directory is treated as absent by every operation (loading it
+returns "not found"), so inserting into a directory that is being deleted fails
+automatically. The tombstone is the durable **commit point**: a crash after
+step 1 leaves `D` logically deleted, with steps 2–3 finished by recovery/GC.
+(One residual window: between steps 1 and 2 an operation that inspects the
+*parent's* entry for `D` rather than loading `D` — e.g. `metadata` — may still
+see it briefly; closing that fully needs the recovery sweep to complete the
+unlink.)
+
+The same pattern generalizes: any operation whose logical commit lives in a
+*different* object than the one it must exclude against has to move its
+compare-and-swap onto the contended object (or take a lock). `rename` above is
+the harder instance, where there are two such objects.
 
 ### Single-writer mode (performance specialization)
 
@@ -183,6 +227,14 @@ stop-the-world and without state outside S3:
    With the root-pointer alternative, GC can instead walk an *immutable snapshot*
    of the current root (Git-style `gc` with a prune grace period), which makes
    the reachability walk race-free by construction.
+
+3. **Half-deleted directories** — a `remove_dir` that sealed a directory with a
+   `deleted` tombstone (step 1 above) but crashed before unlinking and deleting
+   it (steps 2–3). Recovery completes the protocol: a tombstoned directory
+   object is, by definition, logically removed, so the sweep finishes the
+   pending unlink from its parent and then deletes the object. Because a
+   tombstoned directory is invisible to normal operations, leaving the work to a
+   later sweep is safe.
 
 ## Alternatives
 1. *Storing the directory structure elsewhere.* It would add another point of

@@ -56,27 +56,41 @@ impl FileSystem for S3FileSystem {
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        // Unlink from the parent via CAS; the closure yields the child object
-        // name so it can be deleted *after* the unlink has committed (deleting
-        // earlier would leave a dangling reference if the CAS were to fail).
-        let child = self.update_dir(&parent_ref, |old_dir| {
-            let ent = old_dir
-                .children
-                .get(&file_name)
-                .ok_or(FsError::EntryNotFound)?;
-            let child = ent.obj_name.clone();
+        // Locate the child directory object.
+        let child = self
+            .load_dir(&parent_ref)?
+            .as_ref()
+            .get(&file_name)
+            .ok_or(FsError::EntryNotFound)?
+            .obj_name
+            .clone();
+        if !matches!(child, ObjName::Dir(_)) {
+            return Err(FsError::InvalidInput);
+        }
 
-            // `load_dir` also rejects a non-directory entry (`InvalidInput`).
-            let child_dir = self.load_dir(&child)?;
-            if !child_dir.as_ref().children.is_empty() {
+        // Phase 1: tombstone the child *on its own object*. This CAS contends
+        // with any concurrent insert into the child, closing the
+        // check-empty-then-unlink race: either we mark it deleted first (and a
+        // racing insert then reloads and is refused), or the insert lands first
+        // (and we reload, see it non-empty, and refuse with DirectoryNotEmpty).
+        self.update_dir(&child, |old_dir| {
+            if !old_dir.children.is_empty() {
                 return Err(FsError::DirectoryNotEmpty);
             }
-
             let mut dir = old_dir.clone();
-            dir.children.remove(&file_name);
-            Ok((dir, child))
+            dir.deleted = true;
+            Ok((dir, ()))
         })?;
 
+        // Phase 2: unlink from the parent (now safe — the child is sealed).
+        self.update_dir(&parent_ref, |old_dir| {
+            let mut dir = old_dir.clone();
+            dir.children.remove(&file_name);
+            Ok((dir, ()))
+        })?;
+
+        // Phase 3: physically remove the tombstoned object. A crash before this
+        // point leaves a tombstoned/orphaned object for the garbage collector.
         self.store.delete(&child.to_string())?;
         Ok(())
     }

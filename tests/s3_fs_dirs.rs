@@ -154,3 +154,49 @@ async fn test_concurrent_create_dir_same_parent() {
     let count = fs.read_dir(&PathBuf::from("/d")).unwrap().count();
     assert_eq!(count, N);
 }
+
+/// Regression test for the check-empty-then-unlink race in `remove_dir`.
+///
+/// One thread churns `/d` (remove then recreate) while another keeps creating
+/// `/d/sub`. The invariant: whenever a `create_dir("/d/sub")` reports success,
+/// `/d/sub` must actually exist (the worker can then read and remove it). With
+/// the old single-CAS removal, the churner could unlink and delete `/d` right
+/// after the worker's insert committed, losing it — the worker's asserts would
+/// then fail.
+#[tokio::test]
+async fn test_remove_dir_vs_concurrent_create() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = Arc::new(S3FileSystem::init("fs-race".to_owned(), client));
+    fs.create_dir(&PathBuf::from("/d")).unwrap();
+
+    const K: usize = 25;
+
+    let churner = {
+        let fs = Arc::clone(&fs);
+        std::thread::spawn(move || {
+            for _ in 0..K {
+                let _ = fs.remove_dir(&PathBuf::from("/d"));
+                let _ = fs.create_dir(&PathBuf::from("/d"));
+            }
+        })
+    };
+
+    let worker = {
+        let fs = Arc::clone(&fs);
+        std::thread::spawn(move || {
+            for _ in 0..K {
+                if fs.create_dir(&PathBuf::from("/d/sub")).is_ok() {
+                    // The insert committed, so `/d/sub` must be live: the
+                    // churner cannot remove the now-non-empty `/d` underneath us.
+                    fs.metadata(&PathBuf::from("/d/sub")).unwrap();
+                    fs.remove_dir(&PathBuf::from("/d/sub")).unwrap();
+                }
+            }
+        })
+    };
+
+    churner.join().unwrap();
+    worker.join().unwrap();
+}

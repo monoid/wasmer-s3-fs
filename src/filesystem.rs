@@ -78,7 +78,14 @@ impl S3FileSystem {
         }
         let data = self.store.get(&obj_name.to_string())?;
         let (data, etag) = data.into_inner();
-        DirObj::deserialize(&data).map(|data| Versioned::new(data, etag))
+        let dir = DirObj::deserialize(&data)?;
+        // A tombstoned directory is logically gone: any resolve/update through
+        // it must fail, which also makes inserting into a being-deleted
+        // directory fail (its `update_dir` reloads and sees the tombstone).
+        if dir.deleted {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(Versioned::new(dir, etag))
     }
 
     /// Creates a directory object, failing if it already exists.

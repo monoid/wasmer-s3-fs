@@ -11,6 +11,16 @@ use super::ROOT_OBJ_NAME;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirObj {
     pub(crate) children: HashMap<String, S3FsDirEntry>,
+    /// Tombstone marker for two-phase deletion. A directory is first marked
+    /// `deleted` (via a CAS on its own object, which serializes against
+    /// concurrent inserts) and only afterwards unlinked from its parent and
+    /// physically removed. A deleted directory is invisible to all operations.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) deleted: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl DirObj {
