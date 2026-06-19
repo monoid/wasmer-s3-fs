@@ -1,5 +1,6 @@
 mod file;
 mod impls;
+mod store;
 mod tree;
 
 pub use file::S3VirtualFile;
@@ -9,29 +10,28 @@ use std::path::Path;
 
 use virtual_fs::{FsError, OpenOptionsConfig, Result as FsResult};
 
+use self::store::ObjectStore;
 use self::tree::{DirObj, ObjName};
 
 pub const ROOT_OBJ_NAME: &str = "d_root";
 
 pub struct S3FileSystem {
-    bucket: String,
     root_dir: String,
-    client: s3::BlockingClient,
+    store: ObjectStore,
 }
 
 impl S3FileSystem {
     pub fn new(bucket: String, client: s3::BlockingClient) -> Self {
         Self {
-            bucket,
             root_dir: ROOT_OBJ_NAME.to_owned(),
-            client,
+            store: ObjectStore::new(bucket, client),
         }
     }
 
     // Create the new bucket, initialize it and return the client.
     pub fn init(bucket: String, client: s3::BlockingClient) -> Self {
-        client.buckets().create(bucket.clone()).send().unwrap();
         let fs = Self::new(bucket, client);
+        fs.store.create_bucket().unwrap();
         fs.put_dir(&ObjName::root(), &DirObj::default()).unwrap();
         fs
     }
@@ -67,29 +67,18 @@ impl S3FileSystem {
     }
 
     fn load_dir(&self, obj_name: &ObjName) -> FsResult<DirObj> {
+        // Guard against loading a file as a directory: the object content might
+        // happen to deserialize as a `DirObj`, so the name's type is the only
+        // reliable check.
         if !matches!(obj_name, ObjName::Dir(_)) {
             return Err(FsError::InvalidInput);
         }
-        let req = self
-            .client
-            .objects()
-            .get(&self.bucket, &obj_name.to_string())
-            .send()
-            .unwrap();
-        // let etag = req.etag;
-        DirObj::deserialize(&req.bytes().unwrap())
+        let data = self.store.get(&obj_name.to_string())?;
+        DirObj::deserialize(&data)
     }
 
     fn put_dir(&self, obj_name: &ObjName, obj: &DirObj) -> FsResult<()> {
-        let obj_data = obj.serialize()?;
-        let _update_req = self
-            .client
-            .objects()
-            .put(&self.bucket, &obj_name.to_string())
-            .body_bytes(obj_data)
-            .send()
-            .unwrap();
-        Ok(())
+        self.store.put(&obj_name.to_string(), obj.serialize()?)
     }
 
     fn update_dir(
@@ -98,15 +87,7 @@ impl S3FileSystem {
         function: impl Fn(DirObj) -> FsResult<DirObj>,
     ) -> FsResult<DirObj> {
         // TODO CAS update
-
-        let get_req = self
-            .client
-            .objects()
-            .get(&self.bucket, &obj_name.to_string())
-            .send()
-            .unwrap();
-
-        let dir_obj = DirObj::deserialize(&get_req.bytes().unwrap())?;
+        let dir_obj = self.load_dir(obj_name)?;
         let modified_dir_obj = function(dir_obj)?;
 
         self.put_dir(obj_name, &modified_dir_obj)?;
@@ -142,8 +123,8 @@ impl S3FileSystem {
                 return Err(FsError::InvalidInput);
             }
             return Ok(S3VirtualFile::new_read(
-                self.client.clone(),
-                self.bucket.clone(),
+                self.store.client().clone(),
+                self.store.bucket().to_owned(),
                 ent.obj_name.clone(),
                 ent.len,
                 ent.ctime,
@@ -157,18 +138,21 @@ impl S3FileSystem {
                 return Err(FsError::AlreadyExists);
             }
 
+            // File I/O is not part of `ObjectStore` yet; talk to the client
+            // directly for the multipart upload.
             let obj_name = ObjName::gen_file();
             let upload_id = self
-                .client
+                .store
+                .client()
                 .objects()
-                .create_multipart_upload(&self.bucket, obj_name.to_string())
+                .create_multipart_upload(self.store.bucket(), obj_name.to_string())
                 .send()
                 .map_err(|_| FsError::IOError)?
                 .upload_id;
 
             return Ok(S3VirtualFile::new_write(
-                self.client.clone(),
-                self.bucket.clone(),
+                self.store.client().clone(),
+                self.store.bucket().to_owned(),
                 obj_name,
                 upload_id,
                 parent_ref,

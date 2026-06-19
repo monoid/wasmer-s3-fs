@@ -30,14 +30,8 @@ impl FileSystem for S3FileSystem {
             match dir.children.entry(file_name.clone()) {
                 Entry::Occupied(_occupied_entry) => return Err(FsError::AlreadyExists),
                 Entry::Vacant(vacant_entry) => {
-                    let empty_dir = DirObj::default();
                     let dir_obj_name = ObjName::gen_dir();
-                    self.client
-                        .objects()
-                        .put(&self.bucket, dir_obj_name.to_string())
-                        .body_bytes(empty_dir.serialize()?)
-                        .send()
-                        .unwrap();
+                    self.put_dir(&dir_obj_name, &DirObj::default())?;
 
                     let since_the_epoch = timestamp();
 
@@ -70,11 +64,7 @@ impl FileSystem for S3FileSystem {
                     if !dir_obj.children.is_empty() {
                         return Err(FsError::DirectoryNotEmpty);
                     }
-                    self.client
-                        .objects()
-                        .delete(&self.bucket, dir_obj_name.to_string())
-                        .send()
-                        .unwrap();
+                    self.store.delete(&dir_obj_name.to_string())?;
                     occupied_entry.remove();
                 }
                 Entry::Vacant(_vacant_entry) => {
@@ -124,12 +114,8 @@ impl FileSystem for S3FileSystem {
                     let dir_obj_name = &occupied_entry.get().obj_name;
 
                     match dir_obj_name {
-                        ObjName::File(file_obj_name) => {
-                            self.client
-                                .objects()
-                                .delete(&self.bucket, file_obj_name.to_string())
-                                .send()
-                                .unwrap();
+                        ObjName::File(_) => {
+                            self.store.delete(&dir_obj_name.to_string())?;
                             occupied_entry.remove();
                         }
                         ObjName::Dir(_) => {
