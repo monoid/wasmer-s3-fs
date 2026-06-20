@@ -114,16 +114,48 @@ No volume lock is taken; writers coordinate purely through per-object CAS.
   listing becomes N `GET`s instead of one.
 
 * **Cross-directory `rename` is the hard case.** It touches two directory
-  objects and S3 has no multi-object transaction. Options, in increasing order
-  of cost:
-  1. Treat `rename` as the one operation that still takes a short lock — acquire
-     per-directory leases on both directories in a canonical order (sorted by
-     object name, to avoid deadlock). `rename` is rare, so a brief lock is
-     acceptable.
-  2. Record an *intent marker* object ("pending rename from X to Y") before
-     touching either directory, so a crashed rename can be rolled forward or
-     back by recovery. This costs a little extra (transient) state in S3.
-  3. Simply document the non-atomicity and the recovery invariant.
+  objects (remove the entry from source `A`, add it to destination `B`, both
+  pointing at the same object name) and S3 has no multi-object transaction.
+
+  The cleanest approach generalizes the deletion tombstone: store the
+  **intent in the participant nodes themselves**. The tombstone is just the
+  degenerate, single-participant case of this ("this directory is being
+  deleted"); `rename` is the two-participant case. A separate "intent marker"
+  object would also work, but it would have to be reconciled with the
+  directories separately, whereas an in-node intent is serialized by the very
+  same CAS that guards the entries it concerns.
+
+  The protocol is a small saga of three CAS writes:
+  1. **Claim destination** — CAS on `B`: insert a *tentative* entry
+     `y → O` tagged `pending {from: A/x}`. This fails if `y` already exists
+     (`AlreadyExists`), which is exactly what serializes against a concurrent
+     `create(B/y)`.
+  2. **Detach source** — CAS on `A`: remove the entry `x`.
+  3. **Finalize** — CAS on `B`: clear the `pending` tag, making `y` a normal
+     entry.
+
+  A `pending` entry, like a tombstone, is **invisible** to normal lookups, so
+  `B/y` does not resolve and `O` is never observably double-parented while the
+  saga is in flight. Step 1 is the commit point; a crash afterwards is
+  recoverable: a sweep finds the `pending` entry, reads its `{from}`, and rolls
+  the saga forward (or back) deterministically.
+
+  `rename` carries two hazards that deletion does not:
+  * **Cycle prevention** — moving a directory into its own subtree
+    (`mv /a /a/b`) would detach a cycle, so the destination's ancestry must be
+    checked against the source. That check is itself racy on a distributed tree
+    and needs the subtree pinned (by the same intent, or a lock) for the
+    duration.
+  * **Overwrite cleanup** — POSIX `rename` replaces an existing destination, so
+    the displaced object becomes garbage to reclaim (tombstone + GC).
+
+  An external per-directory lock (taken on `A` and `B` in a canonical order to
+  avoid deadlock) is an alternative way to exclude *concurrent* writers, but it
+  does **not** remove the need for the intents: a lock does not survive a crash
+  mid-saga, so recovery still relies on the in-node `pending`/`from` records.
+  Lock + intents together is the simplest fully-correct combination. (Note that
+  the root-pointer alternative sidesteps all of this — `rename` there is one
+  atomic CAS on the root — which is the price/benefit tradeoff of that model.)
 
 * **Garbage collection must be lock-free, and it is** (see "Garbage collection"
   below): the age-based mark-and-sweep needs no coordination with live writers,
