@@ -22,7 +22,8 @@ use s3::BlockingClient;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use virtual_fs::{FsError, Result as FsResult, VirtualFile};
 
-use super::tree::{DirObj, ObjName, S3FsDirEntry};
+use super::store::{self, ObjectStore};
+use super::tree::{ObjName, S3FsDirEntry};
 
 /// Minimum size of a non-final S3 multipart part (5 MiB). Buffered writes are
 /// flushed as a part once this much data has accumulated.
@@ -62,10 +63,8 @@ impl S3VirtualFile {
     ///
     /// On close the object is finalized and an entry named `name` pointing at
     /// `obj_name` is inserted into the `parent` directory object.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_write(
-        client: BlockingClient,
-        bucket: String,
+        store: ObjectStore,
         obj_name: ObjName,
         upload_id: String,
         parent: ObjName,
@@ -73,8 +72,7 @@ impl S3VirtualFile {
         created: u64,
     ) -> Self {
         S3VirtualFile::WriteCreateOperation(WriteCreateOp {
-            client,
-            bucket,
+            store,
             obj_name,
             upload_id,
             parent,
@@ -149,8 +147,7 @@ impl ReadOp {
 
 /// State of a new object being created via a multipart upload.
 pub struct WriteCreateOp {
-    client: BlockingClient,
-    bucket: String,
+    store: ObjectStore,
     /// Object name (S3 key) of the file being written.
     obj_name: ObjName,
     /// Multipart upload id obtained when the file was opened.
@@ -197,10 +194,11 @@ impl WriteCreateOp {
     fn upload_part(&mut self, body: Vec<u8>) -> io::Result<()> {
         let part_number = self.parts.len() as u32 + 1;
         let out = self
-            .client
+            .store
+            .client()
             .objects()
             .upload_part(
-                &self.bucket,
+                self.store.bucket(),
                 self.obj_name.to_string(),
                 &self.upload_id,
                 part_number,
@@ -228,14 +226,20 @@ impl WriteCreateOp {
         // S3 rejects a zero-length part, so an empty file can't go through the
         // multipart machinery — abort it and PUT an empty object instead.
         if self.parts.is_empty() && self.buffer.is_empty() {
-            self.client
+            self.store
+                .client()
                 .objects()
-                .abort_multipart_upload(&self.bucket, self.obj_name.to_string(), &self.upload_id)
+                .abort_multipart_upload(
+                    self.store.bucket(),
+                    self.obj_name.to_string(),
+                    &self.upload_id,
+                )
                 .send()
                 .map_err(to_io)?;
-            self.client
+            self.store
+                .client()
                 .objects()
-                .put(&self.bucket, self.obj_name.to_string())
+                .put(self.store.bucket(), self.obj_name.to_string())
                 .body_bytes(Vec::new())
                 .send()
                 .map_err(to_io)?;
@@ -245,8 +249,8 @@ impl WriteCreateOp {
                 self.upload_part(body)?;
             }
 
-            let mut req = self.client.objects().complete_multipart_upload(
-                &self.bucket,
+            let mut req = self.store.client().objects().complete_multipart_upload(
+                self.store.bucket(),
                 self.obj_name.to_string(),
                 &self.upload_id,
             );
@@ -265,9 +269,10 @@ impl WriteCreateOp {
             return Ok(());
         }
         self.terminal = true;
-        self.client
+        self.store
+            .client()
             .objects()
-            .abort_multipart_upload(&self.bucket, self.obj_name.to_string(), &self.upload_id)
+            .abort_multipart_upload(self.store.bucket(), self.obj_name.to_string(), &self.upload_id)
             .send()
             .map_err(to_io)?;
         Ok(())
@@ -275,37 +280,21 @@ impl WriteCreateOp {
 
     /// Inserts the finished file into its parent directory object.
     ///
-    /// NOTE: this read-modify-write is not yet a CAS update — it mirrors the
-    /// `TODO`s already present in [`super::S3FileSystem`].
+    /// Goes through the shared `update_dir` CAS loop, so it does not clobber
+    /// concurrent changes to the parent and fails (`EntryNotFound`) if the
+    /// parent is being deleted (its tombstone is observed on reload).
     fn register_in_parent(&self) -> io::Result<()> {
-        let key = self.parent.to_string();
-        let data = self
-            .client
-            .objects()
-            .get(&self.bucket, &key)
-            .send()
-            .map_err(to_io)?
-            .bytes()
-            .map_err(to_io)?;
-
-        let mut dir = DirObj::deserialize(&data).map_err(fs_to_io)?;
-        dir.children.insert(
-            self.name.clone(),
-            S3FsDirEntry {
-                obj_name: self.obj_name.clone(),
-                ctime: self.created,
-                len: self.written,
-            },
-        );
-        let body = dir.serialize().map_err(fs_to_io)?;
-
-        self.client
-            .objects()
-            .put(&self.bucket, &key)
-            .body_bytes(body)
-            .send()
-            .map_err(to_io)?;
-        Ok(())
+        let entry = S3FsDirEntry {
+            obj_name: self.obj_name.clone(),
+            ctime: self.created,
+            len: self.written,
+        };
+        store::update_dir(&self.store, &self.parent, |old_dir| {
+            let mut dir = old_dir.clone();
+            dir.children.insert(self.name.clone(), entry.clone());
+            Ok((dir, ()))
+        })
+        .map_err(fs_to_io)
     }
 }
 

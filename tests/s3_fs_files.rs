@@ -319,3 +319,48 @@ async fn test_rename_file_same_dir() {
     file.read_to_end(&mut read_back).await.unwrap();
     assert_eq!(read_back, b"payload");
 }
+
+/// Concurrently creating distinct files in the same parent must not lose
+/// entries: each file's close registers into the parent via the shared CAS
+/// loop. The old raw get+put registration could clobber a sibling's insert.
+#[tokio::test]
+async fn test_concurrent_file_create_same_dir() {
+    use std::sync::Arc;
+
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = Arc::new(S3FileSystem::init("fs-files".to_owned(), client));
+    fs.create_dir(&PathBuf::from("/p")).unwrap();
+
+    const N: usize = 8;
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let fs = Arc::clone(&fs);
+            std::thread::spawn(move || {
+                // The file I/O API is async but backed by the blocking client,
+                // so a tiny current-thread runtime drives it to completion.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let mut f = fs
+                        .new_open_options()
+                        .write(true)
+                        .create_new(true)
+                        .open(&PathBuf::from(format!("/p/file{i}")))
+                        .unwrap();
+                    f.write_all(format!("body{i}").as_bytes()).await.unwrap();
+                    f.shutdown().await.unwrap();
+                });
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let count = fs.read_dir(&PathBuf::from("/p")).unwrap().count();
+    assert_eq!(count, N);
+}

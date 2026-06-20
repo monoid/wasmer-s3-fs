@@ -69,58 +69,25 @@ impl S3FileSystem {
         }
     }
 
+    // The directory-level storage operations live in `store`, over an
+    // `ObjectStore`, so the file-write path can reuse the same CAS machinery.
+    // These are thin convenience wrappers for the call sites that already hold
+    // `&self`.
+
     fn load_dir(&self, obj_name: &ObjName) -> FsResult<Versioned<DirObj>> {
-        // Guard against loading a file as a directory: the object content might
-        // happen to deserialize as a `DirObj`, so the name's type is the only
-        // reliable check.
-        if !matches!(obj_name, ObjName::Dir(_)) {
-            return Err(FsError::InvalidInput);
-        }
-        let data = self.store.get(&obj_name.to_string())?;
-        let (data, etag) = data.into_inner();
-        let dir = DirObj::deserialize(&data)?;
-        // A tombstoned directory is logically gone: any resolve/update through
-        // it must fail, which also makes inserting into a being-deleted
-        // directory fail (its `update_dir` reloads and sees the tombstone).
-        if dir.deleted {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(Versioned::new(dir, etag))
+        store::load_dir(&self.store, obj_name)
     }
 
-    /// Creates a directory object, failing if it already exists.
     fn put_dir_create(&self, obj_name: &ObjName, obj: &DirObj) -> FsResult<CasOutcome> {
-        self.store
-            .put_if_none_match(&obj_name.to_string(), obj.serialize()?)
+        store::put_dir_create(&self.store, obj_name, obj)
     }
 
-    /// Replaces a directory object only if it still has ETag `etag`.
-    fn put_dir_cas(&self, obj_name: &ObjName, etag: &str, obj: &DirObj) -> FsResult<CasOutcome> {
-        self.store
-            .put_if_match(&obj_name.to_string(), obj.serialize()?, etag)
-    }
-
-    /// Atomically updates a directory object with optimistic concurrency.
-    ///
-    /// `function` must be a *pure* `&DirObj -> (new_dir, R)`: it is re-run from a
-    /// freshly loaded copy on every CAS conflict, so it must not have side
-    /// effects (object creation/deletion belongs outside this loop). `R` is
-    /// threaded out to the caller so it can, e.g., learn which child object to
-    /// delete *after* the unlink has committed.
     fn update_dir<R>(
         &self,
         obj_name: &ObjName,
         function: impl Fn(&DirObj) -> FsResult<(DirObj, R)>,
     ) -> FsResult<R> {
-        loop {
-            let current = self.load_dir(obj_name)?;
-            let (new_dir, ret) = function(current.as_ref())?;
-
-            match self.put_dir_cas(obj_name, current.etag(), &new_dir)? {
-                CasOutcome::Written => return Ok(ret),
-                CasOutcome::Conflict => continue, // someone else won; reload and retry
-            }
-        }
+        store::update_dir(&self.store, obj_name, function)
     }
 
     /// Opens `path` according to `conf`, returning the concrete file enum.
@@ -170,8 +137,9 @@ impl S3FileSystem {
                 return Err(FsError::AlreadyExists);
             }
 
-            // File I/O is not part of `ObjectStore` yet; talk to the client
-            // directly for the multipart upload.
+            // Multipart upload is not part of `ObjectStore` yet; talk to the
+            // client directly. The parent-directory registration at close, on
+            // the other hand, goes through `store::update_dir` (CAS).
             let obj_name = ObjName::gen_file();
             let upload_id = self
                 .store
@@ -183,8 +151,7 @@ impl S3FileSystem {
                 .upload_id;
 
             return Ok(S3VirtualFile::new_write(
-                self.store.client().clone(),
-                self.store.bucket().to_owned(),
+                self.store.clone(),
                 obj_name,
                 upload_id,
                 parent_ref,

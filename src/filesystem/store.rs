@@ -12,6 +12,8 @@
 use s3::BlockingClient;
 use virtual_fs::{FsError, Result as FsResult};
 
+use super::tree::{DirObj, ObjName};
+
 /// Outcome of a conditional (compare-and-swap) write.
 ///
 /// A lost CAS race is an *expected* result, not an error, so it is reported as
@@ -49,6 +51,7 @@ impl<T> AsRef<T> for Versioned<T> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ObjectStore {
     bucket: String,
     client: BlockingClient,
@@ -130,6 +133,59 @@ impl ObjectStore {
             .send()
             .map_err(to_fs)?;
         Ok(())
+    }
+}
+
+/// Loads a directory object together with its ETag.
+///
+/// Rejects a non-directory object name (`InvalidInput`) and a tombstoned
+/// directory (`EntryNotFound`) — the latter makes any resolve or update through
+/// a being-deleted directory fail, including inserting into it.
+pub(crate) fn load_dir(store: &ObjectStore, obj_name: &ObjName) -> FsResult<Versioned<DirObj>> {
+    // The name's type is the only reliable check: a file's bytes might happen to
+    // deserialize as a `DirObj`.
+    if !matches!(obj_name, ObjName::Dir(_)) {
+        return Err(FsError::InvalidInput);
+    }
+    let (data, etag) = store.get(&obj_name.to_string())?.into_inner();
+    let dir = DirObj::deserialize(&data)?;
+    if dir.deleted {
+        return Err(FsError::EntryNotFound);
+    }
+    Ok(Versioned::new(dir, etag))
+}
+
+/// Creates a directory object, failing if it already exists.
+pub(crate) fn put_dir_create(
+    store: &ObjectStore,
+    obj_name: &ObjName,
+    obj: &DirObj,
+) -> FsResult<CasOutcome> {
+    store.put_if_none_match(&obj_name.to_string(), obj.serialize()?)
+}
+
+/// Atomically updates a directory object with optimistic concurrency.
+///
+/// `function` must be a *pure* `&DirObj -> (new_dir, R)`: it is re-run from a
+/// freshly loaded copy on every CAS conflict, so it must not have side effects
+/// (object creation/deletion belongs outside this loop). `R` is threaded out to
+/// the caller so it can, e.g., learn which child object to delete *after* the
+/// unlink has committed.
+pub(crate) fn update_dir<R>(
+    store: &ObjectStore,
+    obj_name: &ObjName,
+    function: impl Fn(&DirObj) -> FsResult<(DirObj, R)>,
+) -> FsResult<R> {
+    loop {
+        let current = load_dir(store, obj_name)?;
+        let (new_dir, ret) = function(current.as_ref())?;
+
+        let outcome =
+            store.put_if_match(&obj_name.to_string(), new_dir.serialize()?, current.etag())?;
+        match outcome {
+            CasOutcome::Written => return Ok(ret),
+            CasOutcome::Conflict => continue, // someone else won; reload and retry
+        }
     }
 }
 
