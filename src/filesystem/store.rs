@@ -26,6 +26,7 @@ pub(crate) enum CasOutcome {
     Conflict,
 }
 
+/// A value with etag attached.
 pub(crate) struct Versioned<T> {
     inner: T,
     etag: String,
@@ -78,7 +79,7 @@ impl ObjectStore {
             .buckets()
             .create(self.bucket.clone())
             .send()
-            .map_err(to_fs)?;
+            .map_err(s3_to_fs_error)?;
         Ok(())
     }
 
@@ -89,9 +90,9 @@ impl ObjectStore {
             .objects()
             .get(&self.bucket, key)
             .send()
-            .map_err(to_fs)?;
+            .map_err(s3_to_fs_error)?;
         let etag = req.etag.clone().ok_or(FsError::IOError)?;
-        let bytes = req.bytes().map_err(to_fs)?;
+        let bytes = req.bytes().map_err(s3_to_fs_error)?;
         Ok(Versioned::new(bytes.to_vec(), etag))
     }
 
@@ -104,7 +105,7 @@ impl ObjectStore {
             .objects()
             .put(&self.bucket, key)
             .if_match(etag.to_owned())
-            .map_err(to_fs)?
+            .map_err(s3_to_fs_error)?
             .body_bytes(body)
             .send();
         classify_cas(res)
@@ -119,7 +120,7 @@ impl ObjectStore {
             .objects()
             .put(&self.bucket, key)
             .if_none_match("*")
-            .map_err(to_fs)?
+            .map_err(s3_to_fs_error)?
             .body_bytes(body)
             .send();
         classify_cas(res)
@@ -131,7 +132,7 @@ impl ObjectStore {
             .objects()
             .delete(&self.bucket, key)
             .send()
-            .map_err(to_fs)?;
+            .map_err(s3_to_fs_error)?;
         Ok(())
     }
 }
@@ -171,11 +172,13 @@ pub(crate) fn put_dir_create(
 /// (object creation/deletion belongs outside this loop). `R` is threaded out to
 /// the caller so it can, e.g., learn which child object to delete *after* the
 /// unlink has committed.
-pub(crate) fn update_dir<R>(
+pub(crate) fn cas_update_dir<R>(
     store: &ObjectStore,
     obj_name: &ObjName,
     function: impl Fn(&DirObj) -> FsResult<(DirObj, R)>,
 ) -> FsResult<R> {
+    // N.B. We do not limit number of retries here as it is hard to define a limit.
+    // OTOH, infinite loop in case of constant updates is very unlikely.
     loop {
         let current = load_dir(store, obj_name)?;
         let (new_dir, ret) = function(current.as_ref())?;
@@ -184,7 +187,7 @@ pub(crate) fn update_dir<R>(
             store.put_if_match(&obj_name.to_string(), new_dir.serialize()?, current.etag())?;
         match outcome {
             CasOutcome::Written => return Ok(ret),
-            CasOutcome::Conflict => continue, // someone else won; reload and retry
+            CasOutcome::Conflict => continue, // reload and retry
         }
     }
 }
@@ -195,7 +198,7 @@ fn classify_cas<T>(res: Result<T, s3::Error>) -> FsResult<CasOutcome> {
     match res {
         Ok(_) => Ok(CasOutcome::Written),
         Err(err) if is_precondition_failed(&err) => Ok(CasOutcome::Conflict),
-        Err(err) => Err(to_fs(err)),
+        Err(err) => Err(s3_to_fs_error(err)),
     }
 }
 
@@ -209,6 +212,6 @@ fn is_precondition_failed(err: &s3::Error) -> bool {
 /// TODO: distinguish more cases (e.g. a 404 -> `EntryNotFound`); for now
 /// everything collapses to `IOError`, which is enough for this experimental
 /// prototype. CAS conflicts are handled separately via [`classify_cas`].
-fn to_fs(_err: s3::Error) -> FsError {
+fn s3_to_fs_error(_err: s3::Error) -> FsError {
     FsError::IOError
 }

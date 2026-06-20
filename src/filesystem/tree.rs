@@ -8,6 +8,7 @@ use virtual_fs::{DirEntry, FileType, Metadata, Result as FsResult};
 
 use super::ROOT_OBJ_NAME;
 
+/// A directory object that contains chilrden and two-phase deleted state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirObj {
     pub(crate) children: HashMap<String, S3FsDirEntry>,
@@ -32,11 +33,11 @@ impl DirObj {
         serde_json::to_vec(self).map_err(|_| virtual_fs::FsError::InvalidData)
     }
 
-    pub fn get<'a>(&'a self, component: &str) -> Option<&'a S3FsDirEntry> {
+    pub fn get_entry<'a>(&'a self, component: &str) -> Option<&'a S3FsDirEntry> {
         self.children.get(component)
     }
 
-    pub fn into_dir_entries(&self, parent: &Path) -> Vec<DirEntry> {
+    pub fn get_dir_entries(&self, parent: &Path) -> Vec<DirEntry> {
         self.children
             .iter()
             .map(|(name, ent)| DirEntry {

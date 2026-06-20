@@ -42,7 +42,7 @@ pub enum S3VirtualFile {
 
 impl S3VirtualFile {
     /// Opens an existing object for reading.
-    pub fn new_read(
+    pub(crate) fn new_read(
         client: BlockingClient,
         bucket: String,
         obj_name: ObjName,
@@ -63,7 +63,7 @@ impl S3VirtualFile {
     ///
     /// On close the object is finalized and an entry named `name` pointing at
     /// `obj_name` is inserted into the `parent` directory object.
-    pub fn new_write(
+    pub(crate) fn new_write(
         store: ObjectStore,
         obj_name: ObjName,
         upload_id: String,
@@ -116,11 +116,11 @@ impl ReadOp {
             .objects()
             .get(&self.bucket, &self.key)
             .range_bytes(self.pos, end)
-            .map_err(to_io)?
+            .map_err(s3_to_io_error)?
             .send()
-            .map_err(to_io)?
+            .map_err(s3_to_io_error)?
             .bytes()
-            .map_err(to_io)?;
+            .map_err(s3_to_io_error)?;
 
         buf.put_slice(&bytes);
         self.pos += bytes.len() as u64;
@@ -205,10 +205,10 @@ impl WriteCreateOp {
             )
             .body_bytes(body)
             .send()
-            .map_err(to_io)?;
+            .map_err(s3_to_io_error)?;
         let etag = out
             .etag
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "upload part returned no etag"))?;
+            .ok_or_else(|| io::Error::other("upload part returned no etag"))?;
         self.parts.push((part_number, etag));
         Ok(())
     }
@@ -235,14 +235,14 @@ impl WriteCreateOp {
                     &self.upload_id,
                 )
                 .send()
-                .map_err(to_io)?;
+                .map_err(s3_to_io_error)?;
             self.store
                 .client()
                 .objects()
                 .put(self.store.bucket(), self.obj_name.to_string())
                 .body_bytes(Vec::new())
                 .send()
-                .map_err(to_io)?;
+                .map_err(s3_to_io_error)?;
         } else {
             if !self.buffer.is_empty() {
                 let body = std::mem::take(&mut self.buffer);
@@ -255,9 +255,9 @@ impl WriteCreateOp {
                 &self.upload_id,
             );
             for (number, etag) in &self.parts {
-                req = req.part(*number, etag).map_err(to_io)?;
+                req = req.part(*number, etag).map_err(s3_to_io_error)?;
             }
-            req.send().map_err(to_io)?;
+            req.send().map_err(s3_to_io_error)?;
         }
 
         self.register_in_parent()
@@ -274,7 +274,7 @@ impl WriteCreateOp {
             .objects()
             .abort_multipart_upload(self.store.bucket(), self.obj_name.to_string(), &self.upload_id)
             .send()
-            .map_err(to_io)?;
+            .map_err(s3_to_io_error)?;
         Ok(())
     }
 
@@ -289,12 +289,12 @@ impl WriteCreateOp {
             ctime: self.created,
             len: self.written,
         };
-        store::update_dir(&self.store, &self.parent, |old_dir| {
+        let res = store::cas_update_dir(&self.store, &self.parent, |old_dir| {
             let mut dir = old_dir.clone();
             dir.children.insert(self.name.clone(), entry.clone());
             Ok((dir, ()))
-        })
-        .map_err(fs_to_io)
+        });
+        Ok(res?)
     }
 }
 
@@ -444,11 +444,6 @@ impl std::fmt::Debug for S3VirtualFile {
 }
 
 /// Maps an `s3` error into an [`io::Error`].
-fn to_io(err: s3::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
-}
-
-/// Maps a [`FsError`] into an [`io::Error`] (used for (de)serialization paths).
-fn fs_to_io(err: FsError) -> io::Error {
-    err.into()
+fn s3_to_io_error(err: s3::Error) -> io::Error {
+    io::Error::other(err.to_string())
 }

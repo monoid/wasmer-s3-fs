@@ -15,18 +15,16 @@ impl FileSystem for S3FileSystem {
 
     fn read_dir(&self, path: &std::path::Path) -> FSResult<virtual_fs::ReadDir> {
         let dir_obj = self.resolve_dir(path)?;
-        Ok(virtual_fs::ReadDir::new(dir_obj.as_ref().into_dir_entries(path)))
+        Ok(virtual_fs::ReadDir::new(dir_obj.as_ref().get_dir_entries(path)))
     }
 
     fn create_dir(&self, path: &std::path::Path) -> FSResult<()> {
-        let parent = path.parent().ok_or_else(|| FsError::InvalidInput)?;
+        let parent = path.parent().ok_or(FsError::InvalidInput)?;
         let parent_ref = self.resolve_dir_ref(parent)?;
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        // Create the child directory object first (data-before-pointer). If the
-        // name turns out to be taken, this object is simply left unreferenced
-        // for the garbage collector.
+        // Create the child directory object first (data-before-pointer).
         let dir_obj_name = ObjName::gen_dir();
         self.put_dir_create(&dir_obj_name, &DirObj::default())?;
         let ctime = timestamp();
@@ -51,7 +49,7 @@ impl FileSystem for S3FileSystem {
     }
 
     fn remove_dir(&self, path: &std::path::Path) -> FSResult<()> {
-        let parent = path.parent().ok_or_else(|| FsError::InvalidInput)?;
+        let parent = path.parent().ok_or(FsError::InvalidInput)?;
         let parent_ref = self.resolve_dir_ref(parent)?;
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -60,7 +58,7 @@ impl FileSystem for S3FileSystem {
         let child = self
             .load_dir(&parent_ref)?
             .as_ref()
-            .get(&file_name)
+            .get_entry(&file_name)
             .ok_or(FsError::EntryNotFound)?
             .obj_name
             .clone();
@@ -89,8 +87,7 @@ impl FileSystem for S3FileSystem {
             Ok((dir, ()))
         })?;
 
-        // Phase 3: physically remove the tombstoned object. A crash before this
-        // point leaves a tombstoned/orphaned object for the garbage collector.
+        // Phase 3: physically remove the tombstoned object.
         self.store.delete(&child.to_string())?;
         Ok(())
     }
@@ -152,7 +149,7 @@ impl FileSystem for S3FileSystem {
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         let ent = parent_dir_obj
             .as_ref()
-            .get(&file_name)
+            .get_entry(&file_name)
             .ok_or(FsError::EntryNotFound)?;
 
         Ok(ent.into())
@@ -163,7 +160,7 @@ impl FileSystem for S3FileSystem {
     }
 
     fn remove_file(&self, path: &std::path::Path) -> FSResult<()> {
-        let parent = path.parent().ok_or_else(|| FsError::InvalidInput)?;
+        let parent = path.parent().ok_or(FsError::InvalidInput)?;
         let parent_ref = self.resolve_dir_ref(parent)?;
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -194,11 +191,11 @@ impl FileSystem for S3FileSystem {
 
     fn mount(
         &self,
-        name: String,
-        path: &std::path::Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
+        _name: String,
+        _path: &std::path::Path,
+        _fs: Box<dyn FileSystem + Send + Sync>,
     ) -> FSResult<()> {
-        todo!()
+        Err(FsError::Unsupported)
     }
 }
 

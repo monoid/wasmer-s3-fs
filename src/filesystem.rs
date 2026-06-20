@@ -60,8 +60,8 @@ impl S3FileSystem {
         let parent = self.load_dir(parent_name)?;
         let obj_ref = parent
             .as_ref()
-            .get(component)
-            .ok_or_else(|| FsError::EntryNotFound)?;
+            .get_entry(component)
+            .ok_or(FsError::EntryNotFound)?;
         if !matches!(obj_ref.obj_name, ObjName::Dir(_)) {
             Err(FsError::InvalidInput)
         } else {
@@ -87,7 +87,7 @@ impl S3FileSystem {
         obj_name: &ObjName,
         function: impl Fn(&DirObj) -> FsResult<(DirObj, R)>,
     ) -> FsResult<R> {
-        store::update_dir(&self.store, obj_name, function)
+        store::cas_update_dir(&self.store, obj_name, function)
     }
 
     /// Opens `path` according to `conf`, returning the concrete file enum.
@@ -113,7 +113,7 @@ impl S3FileSystem {
             .to_string();
 
         let parent_dir = self.load_dir(&parent_ref)?;
-        let existing = parent_dir.as_ref().get(&name);
+        let existing = parent_dir.as_ref().get_entry(&name);
 
         // Read-only open of an existing file.
         if conf.read && !conf.write && !conf.append && !conf.create && !conf.create_new {
