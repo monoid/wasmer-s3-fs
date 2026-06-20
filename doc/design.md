@@ -113,6 +113,15 @@ No volume lock is taken; writers coordinate purely through per-object CAS.
   the same logical directory land in different shards. The tradeoff is that a
   listing becomes N `GET`s instead of one.
 
+* **Same-directory `rename` is trivial** and is the only case the prototype
+  implements so far: source and destination share one parent, so moving the
+  entry from one key to another is a single CAS on that one directory object —
+  atomic by construction, with no intent needed. Concurrent mutations of the
+  same directory serialize on that CAS like any other update. (The prototype
+  rejects an existing destination with `AlreadyExists` rather than overwriting
+  it; POSIX-style replace would additionally have to reclaim the displaced
+  object via a tombstone + GC.)
+
 * **Cross-directory `rename` is the hard case.** It touches two directory
   objects (remove the entry from source `A`, add it to destination `B`, both
   pointing at the same object name) and S3 has no multi-object transaction.

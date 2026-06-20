@@ -100,7 +100,49 @@ impl FileSystem for S3FileSystem {
         from: &'a std::path::Path,
         to: &'a std::path::Path,
     ) -> BoxFuture<'a, FSResult<()>> {
-        todo!()
+        Box::pin(async move {
+            let from_parent = from.parent().ok_or(FsError::InvalidInput)?;
+            let to_parent = to.parent().ok_or(FsError::InvalidInput)?;
+
+            // Only same-directory rename is supported so far. The cross-directory
+            // case needs the two-participant intent saga (see the design doc).
+            if from_parent != to_parent {
+                return Err(FsError::Unsupported);
+            }
+
+            let from_name = from
+                .file_name()
+                .ok_or(FsError::InvalidInput)?
+                .to_string_lossy()
+                .to_string();
+            let to_name = to
+                .file_name()
+                .ok_or(FsError::InvalidInput)?
+                .to_string_lossy()
+                .to_string();
+            if from_name == to_name {
+                return Ok(()); // renaming onto itself is a no-op
+            }
+
+            let parent_ref = self.resolve_dir_ref(from_parent)?;
+
+            // A single CAS on the shared parent: move the entry from one key to
+            // another. The closure is pure, so it is safe to retry on conflict.
+            self.update_dir(&parent_ref, |old_dir| {
+                if !old_dir.children.contains_key(&from_name) {
+                    return Err(FsError::EntryNotFound);
+                }
+                if old_dir.children.contains_key(&to_name) {
+                    // No overwrite semantics yet — the destination must be free.
+                    return Err(FsError::AlreadyExists);
+                }
+                let mut dir = old_dir.clone();
+                let entry = dir.children.remove(&from_name).expect("checked above");
+                dir.children.insert(to_name.clone(), entry);
+                Ok((dir, ()))
+            })?;
+            Ok(())
+        })
     }
 
     fn metadata(&self, path: &std::path::Path) -> FSResult<virtual_fs::Metadata> {

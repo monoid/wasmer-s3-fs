@@ -200,3 +200,80 @@ async fn test_remove_dir_vs_concurrent_create() {
     churner.join().unwrap();
     worker.join().unwrap();
 }
+
+/// Same-directory rename moves the entry, preserving its identity.
+#[tokio::test]
+async fn test_rename_same_dir() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-rename".to_owned(), client);
+    fs.create_dir(&PathBuf::from("/a")).unwrap();
+    fs.create_dir(&PathBuf::from("/a/b")).unwrap();
+    let before = fs.metadata(&PathBuf::from("/a/b")).unwrap();
+
+    fs.rename(&PathBuf::from("/a/b"), &PathBuf::from("/a/c"))
+        .await
+        .unwrap();
+
+    // Old name is gone, new name is there with the same (preserved) metadata.
+    fs.metadata(&PathBuf::from("/a/b")).unwrap_err();
+    let after = fs.metadata(&PathBuf::from("/a/c")).unwrap();
+    assert!(after.is_dir());
+    assert_eq!(after.created, before.created);
+
+    // The renamed directory is usable under its new path.
+    fs.create_dir(&PathBuf::from("/a/c/inner")).unwrap();
+}
+
+/// Renaming a missing entry fails.
+#[tokio::test]
+async fn test_rename_missing_source() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-rename".to_owned(), client);
+    fs.create_dir(&PathBuf::from("/a")).unwrap();
+
+    let err = fs
+        .rename(&PathBuf::from("/a/nope"), &PathBuf::from("/a/x"))
+        .await
+        .unwrap_err();
+    assert_eq!(err, virtual_fs::FsError::EntryNotFound);
+}
+
+/// Renaming onto an existing name is rejected (no overwrite yet).
+#[tokio::test]
+async fn test_rename_dest_exists() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-rename".to_owned(), client);
+    fs.create_dir(&PathBuf::from("/a")).unwrap();
+    fs.create_dir(&PathBuf::from("/a/b")).unwrap();
+    fs.create_dir(&PathBuf::from("/a/c")).unwrap();
+
+    let err = fs
+        .rename(&PathBuf::from("/a/b"), &PathBuf::from("/a/c"))
+        .await
+        .unwrap_err();
+    assert_eq!(err, virtual_fs::FsError::AlreadyExists);
+}
+
+/// Cross-directory rename is not implemented yet.
+#[tokio::test]
+async fn test_rename_cross_dir_unsupported() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-rename".to_owned(), client);
+    fs.create_dir(&PathBuf::from("/a")).unwrap();
+    fs.create_dir(&PathBuf::from("/a/b")).unwrap();
+    fs.create_dir(&PathBuf::from("/d")).unwrap();
+
+    let err = fs
+        .rename(&PathBuf::from("/a/b"), &PathBuf::from("/d/b"))
+        .await
+        .unwrap_err();
+    assert_eq!(err, virtual_fs::FsError::Unsupported);
+}

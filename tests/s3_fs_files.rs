@@ -294,3 +294,28 @@ async fn test_remove_file_on_dir_fails() {
     // The directory is untouched.
     assert!(fs.metadata(&path).unwrap().is_dir());
 }
+
+/// A file can be renamed within its directory and read back under the new name.
+#[tokio::test]
+async fn test_rename_file_same_dir() {
+    let container = MinIO::default().start().await.unwrap();
+    let client = minio_s3_client(&container).await;
+
+    let fs = S3FileSystem::init("fs-files".to_owned(), client);
+    write_file(&fs, &PathBuf::from("/from.txt"), b"payload").await;
+
+    fs.rename(&PathBuf::from("/from.txt"), &PathBuf::from("/to.txt"))
+        .await
+        .unwrap();
+
+    fs.metadata(&PathBuf::from("/from.txt")).unwrap_err();
+
+    let mut file = fs
+        .new_open_options()
+        .read(true)
+        .open(&PathBuf::from("/to.txt"))
+        .unwrap();
+    let mut read_back = Vec::new();
+    file.read_to_end(&mut read_back).await.unwrap();
+    assert_eq!(read_back, b"payload");
+}
