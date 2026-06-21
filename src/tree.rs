@@ -114,7 +114,7 @@ impl FromStr for ObjName {
 
 #[cfg(test)]
 mod tests {
-    use crate::filesystem::ROOT_OBJ_NAME;
+    use crate::ROOT_OBJ_NAME;
 
     use super::*;
 

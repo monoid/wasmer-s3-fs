@@ -4,7 +4,7 @@ use virtual_fs::{
     VirtualFile,
 };
 
-use crate::filesystem::{timestamp, tree::{DirObj, ObjName, S3FsDirEntry}};
+use crate::{timestamp, tree::{DirObj, ObjName, S3FsDirEntry}};
 
 use super::S3FileSystem;
 
