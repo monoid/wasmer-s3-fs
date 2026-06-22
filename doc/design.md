@@ -55,7 +55,7 @@ renames cheap.
 
 ## The idea
 
-**N.B. This code implements multi-writer mode.**
+**N.B. This code implements multi-writer mode, but with limitations.**
 
 For simplicity both file data and the directory tree is stored in single S3 bucket.
 
@@ -169,8 +169,27 @@ beneficial, but it is out of scope of this simple implementation.
 Reading a nested path requires several S3 requests; an application may implement
 caching with all the caveats caching has.
 
-### Limitations
-**N.B. This code implements multi-writer mode, though it is hardly a limitation.**
+### Performance considerations
+
+Traversing a path takes O(n), just like for the real FS.  Most modifications
+in absence of contention take O(1), however.
+
+### Locking
+
+Things like renames can be simplified with external RwLock mechanism like `etcd`
+or ZooKeeper. Operations like renames will be safe with writing lock that
+prevents all other participants, and other mutations might be executed with
+read-lock, even if technically it is not a read. And readers should skip locks
+entirely (Unix fs neither doesn't provide consistency with reads parallel with
+mutations).
+
+### Node caching
+
+Traversed paths may be cached for faster access, but implementing it is
+case-dependent (different applications has different mutation patterns).
+
+### Limitations of the implementation
+**N.B. This code implements multi-writer mode, but with limitations.**
 
 1. Only creation time is supported.  Neither modification nor access time is
    supported.
@@ -230,11 +249,3 @@ No volume lock is taken; writers coordinate purely through per-object CAS.
 
 * **Readers never take any lock** in either mode — they just read tree objects
   (optionally cached and validated by ETag).
-
-### Resilience and read-only fallback
-
-Because readers are lock-free and read directly from S3, the read path stays
-available even when the write plane is degraded. A writer that loses its lease
-(or cannot renew it due to connectivity issues) **downgrades to read-only**
-rather than risking split-brain. This gives the required "fallback read-only
-mode" with no extra machinery.
