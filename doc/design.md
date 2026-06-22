@@ -55,6 +55,8 @@ renames cheap.
 
 ## The idea
 
+**N.B. This code implements multi-writer mode.**
+
 For simplicity both file data and the directory tree is stored in single S3 bucket.
 
 Each entity (dir or file) is stored with a name of format "`{type}_{uuid4}`",
@@ -168,6 +170,8 @@ Reading a nested path requires several S3 requests; an application may implement
 caching with all the caveats caching has.
 
 ### Limitations
+**N.B. This code implements multi-writer mode, though it is hardly a limitation.**
+
 1. Only creation time is supported.  Neither modification nor access time is
    supported.
 2. Only new file can be written to, and only entirely, no file updates.
